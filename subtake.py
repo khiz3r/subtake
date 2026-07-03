@@ -12,6 +12,7 @@ Usage:
   python3 subtake.py -f subs.txt --only-vuln -o results.json
 """
 
+import os
 import sys
 import re
 import json
@@ -22,12 +23,163 @@ import socket
 import argparse
 import subprocess
 import threading
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 _PRINT_LOCK = threading.Lock()
 
-VERSION = "3.0.0"
+VERSION = "3.2.0"
 DEBUG = False  # set by --debug flag
+
+# ── Local config / cache ────────────────────────────────────────────────────────
+# Fingerprint & IP-range lists are no longer downloaded on every run. They are
+# fetched once and cached under ~/.config/subtake/, and only refreshed when the
+# user explicitly passes --update-list. Normal runs read the cache (fast, works
+# offline). If no cache exists yet, the tool falls back to the built-in lists
+# and tells the user to run --update-list.
+CONFIG_DIR           = Path.home() / ".config" / "subtake"
+SERVICES_CACHE_FILE  = CONFIG_DIR / "services.json"
+IPS_CACHE_FILE       = CONFIG_DIR / "ips.json"
+
+# ── Online fingerprint source ──────────────────────────────────────────────────
+# can-i-take-over-xyz publishes a machine-readable fingerprint list.
+# We fetch it at startup and merge with built-ins (online wins on name collision).
+# Falls back to built-ins silently on any error.
+_CITOX_URL = (
+    "https://raw.githubusercontent.com/EdOverflow/can-i-take-over-xyz"
+    "/master/fingerprints.json"
+)
+
+def _fetch_online_fingerprints(timeout=5):
+    """Fetch fingerprints from can-i-take-over-xyz.
+    Returns list of dicts normalised to subtake's schema, or [] on failure."""
+    try:
+        import urllib.request
+        with urllib.request.urlopen(_CITOX_URL, timeout=timeout) as resp:
+            raw = json.loads(resp.read().decode())
+    except Exception:
+        return []
+
+    out = []
+    for entry in raw:
+        # Schema from repo: service, cname (list), fingerprint (list of strings),
+        # vulnerable (bool), discussion, documentation, nxdomain (bool)
+        service = entry.get("service") or entry.get("name", "")
+        if not service:
+            continue
+        cnames = entry.get("cname", [])
+        fingerprints = entry.get("fingerprint", [])
+        is_nxdomain = entry.get("nxdomain", False)
+        vulnerable = entry.get("vulnerable", True)
+
+        # Build CNAME regex patterns: escape dots, anchor with $
+        cname_pats = []
+        for c in cnames:
+            c = c.strip().lstrip("*").lstrip(".")
+            if c:
+                # Escape and build a suffix match pattern
+                escaped = re.escape(c)
+                cname_pats.append(rf"(?:^|\.){escaped}$")
+
+        # body can be a string or list in the remote schema
+        if isinstance(fingerprints, str):
+            fingerprints = [fingerprints] if fingerprints else []
+
+        discussion = entry.get("discussion", "")
+        documentation = entry.get("documentation", "")
+
+        svc = {
+            "name": service,
+            "cname": cname_pats,
+            "body": fingerprints,
+            "_online": True,
+        }
+        if discussion:
+            svc["discussion"] = discussion
+        if documentation:
+            svc["documentation"] = documentation
+        if not vulnerable:
+            svc["not_vulnerable"] = True
+        if is_nxdomain:
+            svc["nxdomain_only"] = True
+        out.append(svc)
+    return out
+
+_ONLINE_FP_CACHE = None   # fetched once per process
+_ONLINE_FP_STATUS = None  # human-readable status string shown in the banner
+
+def _ensure_config_dir():
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        return True
+    except Exception as e:
+        dbg("config dir", note=f"could not create {CONFIG_DIR}: {e}")
+        return False
+
+def _load_services_cache():
+    """Load previously-cached online fingerprints from services.json.
+    Returns (list_of_service_dicts, fetched_at_str) or (None, None) if the
+    cache doesn't exist yet or is corrupt/unreadable."""
+    try:
+        with open(SERVICES_CACHE_FILE) as f:
+            data = json.load(f)
+        return data.get("services", []), data.get("fetched_at")
+    except Exception as e:
+        dbg("services cache", note=f"load failed or absent: {e}")
+        return None, None
+
+def _save_services_cache(services):
+    """Persist fetched online fingerprints to services.json."""
+    if not _ensure_config_dir():
+        return False
+    try:
+        payload = {
+            "fetched_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+            "source": _CITOX_URL,
+            "services": services,
+        }
+        with open(SERVICES_CACHE_FILE, "w") as f:
+            json.dump(payload, f, indent=2)
+        return True
+    except Exception as e:
+        dbg("services cache", note=f"save failed: {e}")
+        return False
+
+def _merge_online_services(online):
+    """Merge a list of online fingerprint entries into the global SERVICES list.
+
+    - Services whose name isn't already a builtin are appended as-is.
+    - Services that DO collide with a builtin are NOT used to replace it
+      (builtins carry richer metadata — not_vulnerable guards, edge_case
+      flags, hand-verified claims — that we don't want to lose), but their
+      'discussion'/'documentation' text IS backfilled onto the builtin entry
+      if the builtin doesn't already have it. This is what feeds the
+      'description' field in results for the vast majority of matches, which
+      otherwise stayed empty even on confirmed vulnerable findings.
+
+    Returns (num_added, num_backfilled).
+    """
+    global SERVICES
+    by_name = {s["name"].lower(): s for s in SERVICES}
+    added = 0
+    backfilled = 0
+    for svc in online:
+        key = svc.get("name", "").lower()
+        if not key:
+            continue
+        existing = by_name.get(key)
+        if existing:
+            if svc.get("discussion") and not existing.get("discussion"):
+                existing["discussion"] = svc["discussion"]
+                backfilled += 1
+            if svc.get("documentation") and not existing.get("documentation"):
+                existing["documentation"] = svc["documentation"]
+                backfilled += 1
+        else:
+            SERVICES.append(svc)
+            by_name[key] = svc
+            added += 1
+    return added, backfilled
 
 # ── ANSI colors ────────────────────────────────────────────────────────────────
 R   = "\033[91m"
@@ -771,14 +923,121 @@ ALIVE_HEADERS = [
 ]
 
 # ── Cloud IP ranges (compact CIDR table for A-record takeover detection) ───────
-# Source: AWS ip-ranges.json, Azure ServiceTags, GCP cloud.json (baked in, no fetch)
-# Only the most stable/large blocks are listed — enough to catch obvious cases.
+# At startup we attempt to fetch live IP ranges from each provider's official API.
+# If a fetch fails we silently fall back to the hardcoded CIDRs below.
 import ipaddress as _ipaddress
+
+def _fetch_live_cloud_ranges(timeout=6):
+    """Fetch IP ranges from provider APIs. Returns dict {provider: [ip_network, ...]}.
+    Any failed provider falls back to hardcoded ranges (merged later).
+    Providers: Cloudflare, AWS, GCP, Fastly.
+
+    NOTE: Azure is intentionally NOT fetched live here. Azure's own
+    ServiceTags_Public JSON is ~4.5MB and slow to download/parse, and it isn't
+    actually needed: Azure subdomain takeover is detected via the CNAME +
+    HTTP-body fingerprint path (see SERVICES / "Microsoft Azure"), which never
+    looks at IP ranges at all. The only thing cloud IP ranges feed is the
+    lowest-confidence POSSIBLE_A fallback (an A record with no visible CNAME
+    landing in known cloud IP space) — the built-in representative Azure CIDR
+    blocks below are more than sufficient for that heuristic. If you need
+    exhaustive Azure ranges for some other reason, fetch
+    https://www.microsoft.com/en-us/download/details.aspx?id=56519 manually
+    and merge it into ips.json yourself."""
+    import urllib.request as _req
+    result = {}
+
+    # ── Cloudflare ──────────────────────────────────────────────────────────
+    try:
+        with _req.urlopen("https://www.cloudflare.com/ips-v4", timeout=timeout) as r:
+            cidrs = [l.strip() for l in r.read().decode().splitlines() if l.strip()]
+        result["Cloudflare"] = [_ipaddress.ip_network(c, strict=False) for c in cidrs if "/" in c]
+        dbg("live IPs", note=f"Cloudflare: {len(result['Cloudflare'])} CIDRs")
+    except Exception as e:
+        dbg("live IPs", note=f"Cloudflare fetch failed: {e}")
+
+    # ── AWS ─────────────────────────────────────────────────────────────────
+    try:
+        with _req.urlopen("https://ip-ranges.amazonaws.com/ip-ranges.json", timeout=timeout) as r:
+            data = json.loads(r.read())
+        nets = []
+        for prefix in data.get("prefixes", []):
+            try:
+                nets.append(_ipaddress.ip_network(prefix["ip_prefix"], strict=False))
+            except Exception:
+                pass
+        result["AWS"] = nets
+        dbg("live IPs", note=f"AWS: {len(nets)} CIDRs")
+    except Exception as e:
+        dbg("live IPs", note=f"AWS fetch failed: {e}")
+
+    # ── GCP ─────────────────────────────────────────────────────────────────
+    try:
+        with _req.urlopen("https://www.gstatic.com/ipranges/cloud.json", timeout=timeout) as r:
+            data = json.loads(r.read())
+        nets = []
+        for entry in data.get("prefixes", []):
+            cidr = entry.get("ipv4Prefix") or entry.get("ipv6Prefix")
+            if cidr:
+                try:
+                    nets.append(_ipaddress.ip_network(cidr, strict=False))
+                except Exception:
+                    pass
+        result["GCP"] = nets
+        dbg("live IPs", note=f"GCP: {len(nets)} CIDRs")
+    except Exception as e:
+        dbg("live IPs", note=f"GCP fetch failed: {e}")
+
+    # ── Fastly ──────────────────────────────────────────────────────────────
+    try:
+        with _req.urlopen("https://api.fastly.com/public-ip-list", timeout=timeout) as r:
+            data = json.loads(r.read())
+        nets = []
+        for cidr in data.get("addresses", []) + data.get("ipv6_addresses", []):
+            try:
+                nets.append(_ipaddress.ip_network(cidr, strict=False))
+            except Exception:
+                pass
+        result["Fastly"] = nets
+        dbg("live IPs", note=f"Fastly: {len(nets)} CIDRs")
+    except Exception as e:
+        dbg("live IPs", note=f"Fastly fetch failed: {e}")
+
+    # Azure deliberately omitted — see docstring above. Built-in representative
+    # CIDR blocks (CLOUD_IP_RANGES["Azure"]) are used unconditionally instead.
+
+    return result
 
 def _cidrs(*blocks):
     return [_ipaddress.ip_network(b, strict=False) for b in blocks]
 
 CLOUD_IP_RANGES = {
+    # Cloudflare anycast ranges (https://www.cloudflare.com/ips-v4)
+    # Orange-cloud domains resolve to these — CNAME is hidden, need HTTP fingerprint.
+    "Cloudflare": _cidrs(
+        "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+        "104.16.0.0/13", "104.24.0.0/14",
+        "108.162.192.0/18", "131.0.72.0/22",
+        "141.101.64.0/18", "162.158.0.0/15",
+        "172.64.0.0/13", "173.245.48.0/20",
+        "188.114.96.0/20", "190.93.240.0/20",
+        "197.234.240.0/22", "198.41.128.0/17",
+    ),
+    # Fastly CDN ranges (https://api.fastly.com/public-ip-list)
+    "Fastly": _cidrs(
+        "23.235.32.0/20", "43.249.72.0/22", "103.244.50.0/24",
+        "103.245.222.0/23", "103.245.224.0/24", "104.156.80.0/20",
+        "140.248.64.0/18", "140.248.128.0/17", "146.75.0.0/17",
+        "151.101.0.0/16", "157.52.64.0/18", "167.82.0.0/17",
+        "167.82.128.0/20", "167.82.160.0/20", "167.82.224.0/20",
+        "172.111.64.0/18", "185.31.16.0/22", "199.27.72.0/21",
+        "199.232.0.0/16",
+    ),
+    # Akamai (representative blocks — full list is huge)
+    "Akamai": _cidrs(
+        "23.32.0.0/11", "23.64.0.0/14", "23.72.0.0/13",
+        "72.246.0.0/15", "96.6.0.0/15", "104.64.0.0/10",
+        "184.24.0.0/13", "184.50.0.0/15", "184.84.0.0/14",
+    ),
     "AWS": _cidrs(
         "3.0.0.0/8", "13.32.0.0/15", "13.224.0.0/14", "13.249.0.0/19",
         "18.140.0.0/14", "18.168.0.0/14", "18.184.0.0/14", "18.196.0.0/15",
@@ -808,13 +1067,97 @@ CLOUD_IP_RANGES = {
     ),
 }
 
+_LIVE_CLOUD_RANGES = None   # populated at startup by _init_cloud_ranges()
+_CLOUD_RANGES_SOURCE = "built-in"
+
+def _load_ips_cache():
+    """Load cached cloud IP ranges from ips.json.
+    Returns (dict{provider: [ip_network,...]}, fetched_at_str) or (None, None)."""
+    try:
+        with open(IPS_CACHE_FILE) as f:
+            data = json.load(f)
+        ranges = {}
+        for provider, cidrs in data.get("ranges", {}).items():
+            nets = []
+            for c in cidrs:
+                try:
+                    nets.append(_ipaddress.ip_network(c, strict=False))
+                except Exception:
+                    pass
+            if nets:
+                ranges[provider] = nets
+        return ranges, data.get("fetched_at")
+    except Exception as e:
+        dbg("ips cache", note=f"load failed or absent: {e}")
+        return None, None
+
+def _save_ips_cache(ranges):
+    """Persist cloud IP ranges (dict of provider -> [ip_network,...]) to ips.json."""
+    if not _ensure_config_dir():
+        return False
+    try:
+        payload = {
+            "fetched_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+            "ranges": {p: [str(n) for n in nets] for p, nets in ranges.items()},
+        }
+        with open(IPS_CACHE_FILE, "w") as f:
+            json.dump(payload, f, indent=2)
+        return True
+    except Exception as e:
+        dbg("ips cache", note=f"save failed: {e}")
+        return False
+
+def _init_cloud_ranges(no_online=False, update_list=False):
+    """Populate cloud IP ranges from local cache (default), a forced live
+    fetch (--update-list), or built-ins only (--no-online). Normal runs no
+    longer hit the network — they just read ~/.config/subtake/ips.json."""
+    global _LIVE_CLOUD_RANGES, _CLOUD_RANGES_SOURCE
+
+    if update_list:
+        live = _fetch_live_cloud_ranges()
+        if live:
+            merged = dict(CLOUD_IP_RANGES)
+            merged.update({p: n for p, n in live.items() if n})
+            _LIVE_CLOUD_RANGES = merged
+            saved = _save_ips_cache(merged)
+            _CLOUD_RANGES_SOURCE = f"updated ({', '.join(sorted(live.keys()))})"
+            return saved
+        else:
+            cached, fetched_at = _load_ips_cache()
+            if cached:
+                merged = dict(CLOUD_IP_RANGES)
+                merged.update(cached)
+                _LIVE_CLOUD_RANGES = merged
+                _CLOUD_RANGES_SOURCE = f"update failed — kept existing cache ({fetched_at})"
+            else:
+                _LIVE_CLOUD_RANGES = CLOUD_IP_RANGES
+                _CLOUD_RANGES_SOURCE = "update failed, no cache — built-in only"
+        return False  # nothing new was written to ips.json this run
+
+    if no_online:
+        _LIVE_CLOUD_RANGES = CLOUD_IP_RANGES
+        _CLOUD_RANGES_SOURCE = "built-in (--no-online)"
+        return False
+
+    cached, fetched_at = _load_ips_cache()
+    if cached:
+        merged = dict(CLOUD_IP_RANGES)
+        merged.update(cached)
+        _LIVE_CLOUD_RANGES = merged
+        _CLOUD_RANGES_SOURCE = f"cached ({fetched_at})"
+    else:
+        _LIVE_CLOUD_RANGES = CLOUD_IP_RANGES
+        _CLOUD_RANGES_SOURCE = "built-in (no cache — run --update-list to fetch)"
+    return False
+
 def _ip_to_cloud(ip_str):
     """Return cloud provider name if ip_str falls in a known cloud range, else None."""
     try:
         addr = _ipaddress.ip_address(ip_str)
     except ValueError:
         return None
-    for provider, nets in CLOUD_IP_RANGES.items():
+    ranges = _LIVE_CLOUD_RANGES if _LIVE_CLOUD_RANGES is not None else CLOUD_IP_RANGES
+    for provider, nets in ranges.items():
         for net in nets:
             if addr in net:
                 return provider
@@ -1082,7 +1425,7 @@ def detect_wildcard(domain):
     return resolves
 
 # ── HTTP helper ────────────────────────────────────────────────────────────────
-def curl_fetch(domain, force_http=False):
+def curl_fetch(domain, force_http=False, no_follow=False):
     """Return (status_code, headers_str, body_str) via curl.
 
     Tries HTTPS first. If force_http=True or HTTPS fails with a connection
@@ -1090,10 +1433,16 @@ def curl_fetch(domain, force_http=False):
 
     Status code is extracted from the *last* HTTP response block so that
     curl -L redirect chains don't leave us with a 301 instead of the final code.
+
+    no_follow=True: skip --location so we see the raw response of the target
+    domain (important for CDN-proxied fingerprinting where a redirect would
+    take us to a completely different page).
     """
     def _run(url):
-        cmd = ["curl", "-si", "--max-time", "10", "--location",
+        cmd = ["curl", "-si", "--max-time", "10",
                "-A", "Mozilla/5.0 (subtake.py)", url]
+        if not no_follow:
+            cmd.insert(3, "--location")
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
             raw = r.stdout
@@ -1154,6 +1503,46 @@ def match_service(cname):
                 return svc
     return None
 
+_MD_LINK_RE = re.compile(r'^\[(?P<label>[^\]]+)\]\((?P<url>https?://[^\)]+)\)$')
+
+def _clean_ref(text):
+    """can-i-take-over-xyz ships discussion/documentation as raw markdown, e.g.
+    '[Issue #152](https://github.com/.../152)'. That renders as ugly literal
+    brackets in a terminal. Convert to 'Label — url'; leave plain text/bare
+    URLs untouched."""
+    if not text:
+        return text
+    m = _MD_LINK_RE.match(text.strip())
+    if m:
+        return f"{m.group('label')} — {m.group('url')}"
+    return text.strip()
+
+def _apply_svc_description(result, svc):
+    """Populate result['description'] with reference info for the matched service.
+
+    Prefers discussion/documentation links backfilled from can-i-take-over-xyz
+    (via --update-list). If none are cached for this service, falls back to a
+    generic-but-useful pointer instead of leaving the field empty — a real
+    finding should never come back with description: null just because we
+    haven't fetched metadata for that particular service yet.
+    """
+    if not svc:
+        return
+    parts = []
+    disc = _clean_ref(svc.get("discussion", ""))
+    docs = _clean_ref(svc.get("documentation", ""))
+    if disc:
+        parts.append(f"Discussion: {disc}")
+    if docs:
+        parts.append(f"Docs: {docs}")
+    if not parts:
+        parts.append(
+            f"No cached discussion/documentation for '{svc['name']}'. "
+            f"Run with --update-list to fetch reference links, or check "
+            f"https://github.com/EdOverflow/can-i-take-over-xyz for this fingerprint."
+        )
+    result["description"] = "  |  ".join(parts)
+
 def check_body_fingerprint(svc, body, headers):
     """Return True if body/headers match known vulnerable fingerprints."""
     # First: bail out if NOT-vulnerable signals are present
@@ -1176,7 +1565,26 @@ def check_body_fingerprint(svc, body, headers):
     return False
 
 # ── Core check ─────────────────────────────────────────────────────────────────
+_INTERESTING_VERDICTS = ("VULNERABLE", "VULNERABLE_NS", "POSSIBLE",
+                          "POSSIBLE_MX", "POSSIBLE_SPF", "POSSIBLE_A")
+
 def check_subdomain(domain, force_http=False):
+    """Thin wrapper around _check_subdomain_impl that guarantees 'description'
+    is never left null on a result the user actually needs to act on (VULNERABLE/
+    POSSIBLE/*). Findings that don't map to a known SERVICES entry - e.g. dangling
+    NS delegation, dead MX, dead SPF include, unknown dead-hop service - never went
+    through _apply_svc_description at all, so they previously reported description:
+    null even though they ARE a real finding worth a note."""
+    result = _check_subdomain_impl(domain, force_http=force_http)
+    if result and result.get("verdict") in _INTERESTING_VERDICTS and not result.get("description"):
+        result["description"] = (
+            "This finding type (DNS delegation/records, not a third-party SaaS "
+            "fingerprint) has no can-i-take-over-xyz reference - see the 'reason' "
+            "and 'claim' fields above for exploitation details."
+        )
+    return result
+
+def _check_subdomain_impl(domain, force_http=False):
     domain = domain.strip().lower()
     if not domain:
         return None
@@ -1198,6 +1606,7 @@ def check_subdomain(domain, force_http=False):
         "confidence": None,   # HIGH / MEDIUM / LOW
         "reason": None,
         "claim": None,
+        "description": None,   # discussion/documentation link from can-i-take-over-xyz
     }
 
     # Step 1: CNAME
@@ -1235,6 +1644,7 @@ def check_subdomain(domain, force_http=False):
                 if svc:
                     result["service"] = svc["name"]
                     result["claim"] = svc["claim"]
+                    _apply_svc_description(result, svc)
                 else:
                     result["service"] = "Unknown"
                     result["claim"] = "Identify service at dead hop and register the slug"
@@ -1315,38 +1725,74 @@ def check_subdomain(domain, force_http=False):
                     )
                     return result
 
-        # ── Step 1e: A record → cloud IP fingerprint ─────────────────────────
+        # ── Step 1e: A record → cloud/CDN IP fingerprint ────────────────────
         a_ips = dig_a(domain)
         if a_ips:
             result["a_ips"] = a_ips
             cloud_ips = [(ip, _ip_to_cloud(ip)) for ip in a_ips if _ip_to_cloud(ip)]
             if cloud_ips:
-                # Fetch HTTP once for the domain, then test all cloud IPs
-                status, headers, body = curl_fetch(domain, force_http=force_http)
-                result["status_code"] = status
                 first_ip, first_provider = cloud_ips[0]
                 result["cloud_provider"] = first_provider
+
+                # Cloudflare orange-cloud note: when a domain is Cloudflare-proxied,
+                # dig CNAME returns empty (hidden behind anycast A records).
+                # The CNAME still exists at origin but is invisible to public DNS.
+                # We MUST do an HTTP fingerprint check here — DNS-only recon is blind.
+                is_cdn_proxy = first_provider in ("Cloudflare", "Fastly", "Akamai")
+
+                # Fetch HTTP without following redirects so we see the actual
+                # unclaimed-service error page, not a redirect destination.
+                status, headers, body = curl_fetch(domain, force_http=force_http,
+                                                   no_follow=is_cdn_proxy)
+                result["status_code"] = status
+
                 # Check all services for a fingerprint match
+                matched_svc = None
                 for svc in SERVICES:
                     if svc.get("not_vulnerable"):
                         continue
                     if check_body_fingerprint(svc, body, headers):
+                        matched_svc = svc
+                        break
+
+                if matched_svc:
+                    if is_cdn_proxy:
+                        result["verdict"] = "POSSIBLE"
+                        result["confidence"] = "MEDIUM"
+                        result["service"] = matched_svc["name"]
+                        result["reason"] = (
+                            f"A records resolve to {first_provider} proxy ({first_ip}) — "
+                            f"origin CNAME hidden (orange-cloud). HTTP response matches "
+                            f"'{matched_svc['name']}' unclaimed-service fingerprint. "
+                            f"Verify manually: the backend slot may be claimable."
+                        )
+                    else:
                         result["verdict"] = "POSSIBLE_A"
                         result["confidence"] = "LOW"
-                        result["service"] = svc["name"]
+                        result["service"] = matched_svc["name"]
                         result["reason"] = (
-                            f"A record {first_ip} is in {first_provider} IP space and HTTP response "
-                            f"matches '{svc['name']}' takeover fingerprint "
+                            f"A record {first_ip} is in {first_provider} IP space and HTTP "
+                            f"response matches '{matched_svc['name']}' takeover fingerprint "
                             f"(IP recycling — low confidence, manual verify required)"
                         )
-                        result["claim"] = svc["claim"]
-                        return result
-                # Cloud IP but no fingerprint match
-                result["verdict"] = "NOT_VULNERABLE"
-                result["reason"] = (
-                    f"A record {first_ip} is in {first_provider} IP space but no takeover "
-                    f"fingerprint matched in HTTP response"
-                )
+                    result["claim"] = matched_svc["claim"]
+                    _apply_svc_description(result, matched_svc)
+                    return result
+
+                if is_cdn_proxy:
+                    # CDN proxy, no fingerprint match — flag as proxied, not safe-clean
+                    result["verdict"] = "NOT_VULNERABLE"
+                    result["reason"] = (
+                        f"A records resolve to {first_provider} proxy ({first_ip}) — "
+                        f"origin CNAME hidden. No unclaimed-service fingerprint matched "
+                        f"in HTTP response. Appears live/claimed."
+                    )
+                else:
+                    result["verdict"] = "NOT_VULNERABLE"
+                    result["reason"] = (
+                        f"A record {first_ip} is in {first_provider} IP space but no takeover "
+                        f"fingerprint matched in HTTP response"
+                    )
                 return result
 
             # Has A records but no cloud IP → completely live non-cloud host
@@ -1377,10 +1823,22 @@ def check_subdomain(domain, force_http=False):
         result["confidence"] = "HIGH"
         result["reason"] = f"CNAME target '{cname}' returns NXDOMAIN — slot is unclaimed"
         result["claim"] = svc["claim"] if svc else "Identify service and register the slug"
+        _apply_svc_description(result, svc)
         return result
 
-    # NXDOMAIN-only services that resolved (i.e. the slot IS claimed) → not vulnerable
-    if svc and svc.get("nxdomain_only"):
+    # NXDOMAIN-only services that resolved (i.e. the slot IS claimed) → not vulnerable.
+    #
+    # BUG FIX: this used to short-circuit unconditionally whenever nxdomain_only
+    # was set, which made any 'body' fingerprints on that service unreachable
+    # dead code. Azure is the concrete case: its shared frontend IP resolves
+    # for ANY *.azurewebsites.net-style hostname whether claimed or not — DNS
+    # always resolves, so nxdomain_only-style logic alone produces a false
+    # NOT_VULNERABLE. The real signal for Azure is the HTTP body ("404 Web Site
+    # not found" / "This web app has been stopped"), which is exactly the body
+    # list already defined on that SERVICES entry but was never being checked.
+    # Fix: only take the NXDOMAIN-only shortcut when there's no body fingerprint
+    # to fall back on; otherwise continue to Step 3 (HTTP fetch) below.
+    if svc and svc.get("nxdomain_only") and not svc.get("body"):
         result["verdict"] = "NOT_VULNERABLE"
         result["reason"] = f"CNAME resolves — {svc['name']} slot appears to be claimed"
         return result
@@ -1407,6 +1865,7 @@ def check_subdomain(domain, force_http=False):
             result["confidence"] = "MEDIUM"
             result["reason"] = f"CNAME resolves but {svc['name']} error fingerprint matched in response"
         result["claim"] = svc["claim"]
+        _apply_svc_description(result, svc)
     else:
         result["verdict"] = "NOT_VULNERABLE"
         result["reason"] = f"CNAME resolves to live {svc['name']} infrastructure — no takeover fingerprint found"
@@ -1494,8 +1953,19 @@ def print_result(r):
 
     print(f"  {BOLD}Reason   :{RST} {DIM}{r['reason']}{RST}")
 
-    if r.get("claim"):
-        print(f"  {BOLD}Claim via:{RST} {Y}{r['claim']}{RST}")
+    if r.get("claim") or r.get("description"):
+        print(f"  {DIM}{'-'*58}{RST}")
+        print(f"  {BOLD}Remediation{RST}")
+        if r.get("claim"):
+            print(f"    {Y}{BOLD}{'Claim':<10}{RST}: {r['claim']}")
+        if r.get("description"):
+            for part in r["description"].split("  |  "):
+                part = part.strip()
+                label, sep, rest = part.partition(":")
+                if sep:
+                    print(f"    {C}{BOLD}{label.strip():<10}{RST}: {rest.strip()}")
+                else:
+                    print(f"    {DIM}{part}{RST}")
 
 def print_summary(results):
     vuln     = [r for r in results if r and r["verdict"] in ("VULNERABLE", "VULNERABLE_NS")]
@@ -1527,6 +1997,15 @@ def print_summary(results):
 # ── Main ───────────────────────────────────────────────────────────────────────
 def banner():
     dig_note = f"{G}dig available{RST}" if DIG_AVAILABLE else f"{Y}dig not found — using socket fallback{RST}"
+    status = _ONLINE_FP_STATUS or ""
+    if status.startswith("cached") or status.startswith("updated"):
+        online_note = f"{G}fingerprints: {status}{RST}"
+    elif status.startswith("skipped") or status.startswith("no cache"):
+        online_note = f"{DIM}fingerprints: {status}{RST}"
+    elif status:
+        online_note = f"{Y}fingerprints: {status}{RST}"
+    else:
+        online_note = ""
     print(f"""{C}{BOLD}
   ███████╗██╗   ██╗██████╗ ████████╗ █████╗ ██╗  ██╗███████╗
   ██╔════╝██║   ██║██╔══██╗╚══██╔══╝██╔══██╗██║ ██╔╝██╔════╝
@@ -1534,8 +2013,10 @@ def banner():
   ╚════██║██║   ██║██╔══██╗   ██║   ██╔══██║██╔═██╗ ██╔══╝
   ███████║╚██████╔╝██████╔╝   ██║   ██║  ██║██║  ██╗███████╗
   ╚══════╝ ╚═════╝ ╚═════╝    ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝
-{RST}{DIM}  Subdomain Takeover Decision Tool  v{VERSION}  —  {dig_note}
-  Services: {len(SERVICES)} fingerprints ({sum(1 for s in SERVICES if not s.get('not_vulnerable'))} vulnerable/edge-case){RST}
+{RST}{DIM}  Subdomain Takeover v{VERSION}  —  {dig_note}
+  {online_note}
+  Services: {len(SERVICES)} fingerprints ({sum(1 for s in SERVICES if not s.get('not_vulnerable'))} vulnerable/edge-case)
+  IP ranges: {_CLOUD_RANGES_SOURCE}{RST}
 """)
 
 def main():
@@ -1557,6 +2038,13 @@ def main():
     parser.add_argument("--debug",          action="store_true",
                         help="Show raw output of every command")
     parser.add_argument("-v", "--version",  action="store_true", help="Print version and exit")
+    parser.add_argument("--no-online",      action="store_true",
+                        help="Don't read the local fingerprint/IP cache either — "
+                             "use the built-in list only")
+    parser.add_argument("--update-list",    action="store_true",
+                        help="Download the latest fingerprints (can-i-take-over-xyz) "
+                             "and cloud IP ranges and refresh the local cache at "
+                             "~/.config/subtake/ (services.json, ips.json)")
     args = parser.parse_args()
 
     if args.version:
@@ -1566,7 +2054,48 @@ def main():
     global DEBUG
     DEBUG = args.debug
 
+    # ── Cloud IP ranges: read from local cache by default, only network on --update-list
+    ips_cache_saved = _init_cloud_ranges(no_online=args.no_online, update_list=args.update_list)
+
+    # ── Fingerprints: read from local cache by default, only network on --update-list
+    global SERVICES, _ONLINE_FP_STATUS
+    services_cache_saved = False
+    if args.update_list:
+        online = _fetch_online_fingerprints()
+        if online:
+            added, backfilled = _merge_online_services(online)
+            services_cache_saved = _save_services_cache(online)
+            _ONLINE_FP_STATUS = (f"updated: {len(online)} fetched, +{added} new, "
+                                  f"{backfilled} descriptions backfilled")
+        else:
+            cached, fetched_at = _load_services_cache()
+            if cached:
+                added, backfilled = _merge_online_services(cached)
+                _ONLINE_FP_STATUS = f"update failed (network) — kept existing cache ({fetched_at})"
+            else:
+                _ONLINE_FP_STATUS = "update failed (network), no cache — built-in only"
+    elif args.no_online:
+        _ONLINE_FP_STATUS = "skipped (--no-online)"
+    else:
+        cached, fetched_at = _load_services_cache()
+        if cached is not None:
+            added, backfilled = _merge_online_services(cached)
+            _ONLINE_FP_STATUS = f"cached ({fetched_at}), +{added} new"
+        else:
+            _ONLINE_FP_STATUS = "no cache — run --update-list to fetch (using built-in only)"
+
     banner()
+
+    if args.update_list:
+        if services_cache_saved:
+            print(f"  {G}✓ Cache refreshed →{RST} {SERVICES_CACHE_FILE}")
+        else:
+            print(f"  {Y}✗ Fingerprint fetch failed — {SERVICES_CACHE_FILE} not updated{RST}")
+        if ips_cache_saved:
+            print(f"  {G}✓ Cache refreshed →{RST} {IPS_CACHE_FILE}")
+        else:
+            print(f"  {Y}✗ IP range fetch failed — {IPS_CACHE_FILE} not updated{RST}")
+        print()
 
     # Collect targets
     targets = []
@@ -1604,7 +2133,8 @@ def main():
             with _PRINT_LOCK:
                 print_result(r)
 
-    print_summary(results)
+    if len(targets) > 1:
+        print_summary(results)
 
     _interesting = ("VULNERABLE", "VULNERABLE_NS", "POSSIBLE", "POSSIBLE_MX", "POSSIBLE_SPF", "POSSIBLE_A")
 
